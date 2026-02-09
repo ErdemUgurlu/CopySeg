@@ -1,6 +1,6 @@
 # CopySeg
 
-A C++ based k-mer preprocessing and Python (HMM) based segmentation tool.
+**CopySeg** is a high-performance C++ bioinformatics HMM based tool designed for **Copy Number Variation (CNV)** analysis using high-noise k-mer data.
 
 ## 🛠 Usage
 
