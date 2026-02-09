@@ -5,7 +5,7 @@
 ## 🛠 Usage
 
 ### 1. Preprocessing (C++)
-To clean and filter k-mer data for noise reduction:
+To run the tool:
 ```bash
 g++ -O3 preprocess_kmers_v5.cpp -o preprocess
 ./preprocess input.kmers output.clean
