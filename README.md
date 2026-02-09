@@ -4,14 +4,6 @@
 
 ## 🛠 Usage
 
-### 1. Preprocessing (C++)# CopySeg
-
-**CopySeg** is a high-performance C++ bioinformatics HMM based tool designed for **Copy Number Variation (CNV)** analysis using high-noise k-mer data.
-
-## 🛠 Usage
-
-
-
 First, compile and run the preprocessing script to clean the k-mer data:
 
 ```bash
