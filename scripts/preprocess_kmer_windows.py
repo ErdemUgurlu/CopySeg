@@ -41,16 +41,18 @@ Date: March 2026
 
 import argparse
 import array as _array
+import json
 import math
+import os
 import sys
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 
 import numpy as np
 import pandas as pd
 
 from chrom_utils import (
     MITO_PATTERNS, CHRX_PATTERNS, CHRY_PATTERNS,
-    is_mito, natural_chrom_key,
+    is_mito, natural_chrom_key, resolve_chrom,
 )
 
 EPSILON = 1e-3
@@ -76,6 +78,73 @@ THRESHOLD_FACTORS = {
     'Other':          150.0,
     'None':           150.0,
 }
+
+
+# ============================================================================
+# MULTIPLICITY WEIGHT LOADER
+# ============================================================================
+
+class WeightLoader:
+    """Lazy loader for per-chromosome k-mer multiplicity weight arrays.
+
+    Weight arrays are produced by compute_multiplicity_weights.py (float16 .npy).
+    Each array maps genomic position → weight = M_ref / M_target.
+
+    Uses LRU cache to limit memory (max_cached chromosomes at a time).
+    Handles chromosome name resolution (chr/bare/CM039) via chrom_utils.
+    """
+
+    def __init__(self, weight_dir, max_cached=3):
+        self.weight_dir = weight_dir
+        self.max_cached = max_cached
+        self._cache = OrderedDict()
+        self._chrom_map = {}  # input_name → npy_chrom_name
+
+        manifest_path = os.path.join(weight_dir, 'manifest.json')
+        if not os.path.exists(manifest_path):
+            raise FileNotFoundError(f"manifest.json not found in {weight_dir}")
+        with open(manifest_path) as f:
+            self._manifest = json.load(f)
+
+        self.k_target = self._manifest.get('k_target', '?')
+        self.k_ref = self._manifest.get('k_ref', '?')
+        self._weight_chroms = set(self._manifest.get('chromosomes', {}).keys())
+
+    def _resolve(self, chrom):
+        """Map input chromosome name to weight file chromosome name."""
+        if chrom in self._chrom_map:
+            return self._chrom_map[chrom]
+        resolved = resolve_chrom(chrom, self._weight_chroms)
+        self._chrom_map[chrom] = resolved
+        return resolved
+
+    def _ensure_loaded(self, chrom):
+        """Load weight array for chromosome, return it (or None)."""
+        resolved = self._resolve(chrom)
+        if resolved is None:
+            return None
+        if resolved in self._cache:
+            self._cache.move_to_end(resolved)
+            return self._cache[resolved]
+        npy_path = os.path.join(self.weight_dir, f"{resolved}.npy")
+        if not os.path.exists(npy_path):
+            return None
+        arr = np.load(npy_path)
+        self._cache[resolved] = arr
+        self._cache.move_to_end(resolved)
+        if len(self._cache) > self.max_cached:
+            self._cache.popitem(last=False)
+        return arr
+
+    def get_weights_bulk(self, chrom, positions):
+        """Return float32 weight array for the given numpy positions array."""
+        arr = self._ensure_loaded(chrom)
+        weights = np.ones(len(positions), dtype=np.float32)
+        if arr is None:
+            return weights
+        valid = (positions >= 0) & (positions < len(arr))
+        weights[valid] = arr[positions[valid]].astype(np.float32)
+        return weights
 
 
 # ============================================================================
@@ -136,13 +205,18 @@ def build_bin_threshold_map(rm_lookup: dict,
 # STEP 0: Histogram sampling → Gaussian peak → biological threshold
 # ============================================================================
 
-def build_histogram_sample(filepath, sample_chunks=10, chunk_size=5_000_000):
+def build_histogram_sample(filepath, sample_chunks=10, chunk_size=5_000_000,
+                           weight_loader=None):
     """
     Read the first sample_chunks chunks to build a k-mer count histogram.
 
     A 50M-line sample (default: 10 × 5M) is sufficient to identify the
     Gaussian peak (= single-copy sequencing depth) without reading the full
     2.5B-line file.
+
+    When weight_loader is provided, multiplicity weights are applied to
+    raw counts BEFORE histogramming, so the Gaussian peak reflects the
+    corrected single-copy depth (not the multiplicity-inflated depth).
 
     NOTE (A4): For chromosome-sorted files this covers chr1 and part of chr2.
     For CHM13 and standard ONT datasets, chr1 is representative of genome-wide
@@ -157,20 +231,40 @@ def build_histogram_sample(filepath, sample_chunks=10, chunk_size=5_000_000):
     """
     hist = np.zeros(65536, dtype=np.int64)
 
+    # When weight_loader is provided, we need chrom + position columns
+    if weight_loader is not None:
+        usecols = [0, 1, 3]
+        col_names = ['chrom', 'start', 'raw_cn']
+        col_dtypes = {'chrom': str, 'start': np.int32, 'raw_cn': np.float32}
+    else:
+        usecols = [3]
+        col_names = ['raw_cn']
+        col_dtypes = {'raw_cn': np.float32}
+
     reader = pd.read_csv(
         filepath,
         sep='\t',
         header=None,
         comment='#',
-        usecols=[3],
-        names=['raw_cn'],
-        dtype={'raw_cn': np.float32},
+        usecols=usecols,
+        names=col_names,
+        dtype=col_dtypes,
         chunksize=chunk_size,
     )
 
     n_chunks = 0
     for chunk in reader:
-        counts = np.clip(chunk['raw_cn'].values, 0, 65535).astype(np.int32)
+        counts = chunk['raw_cn'].values.copy()
+
+        # Apply multiplicity weights before histogramming
+        if weight_loader is not None:
+            for chrom_name in chunk['chrom'].unique():
+                mask = chunk['chrom'].values == chrom_name
+                positions = chunk['start'].values[mask]
+                weights = weight_loader.get_weights_bulk(chrom_name, positions)
+                counts[mask] *= weights
+
+        counts = np.clip(counts, 0, 65535).astype(np.int32)
         np.add.at(hist, counts, 1)
         n_chunks += 1
         if n_chunks >= sample_chunks:
@@ -277,7 +371,7 @@ def _winsorized_mean(values_buf, p_low=5.0, p_high=95.0):
 
 
 def aggregate_windows(filepath, window_size, bio_threshold=0,
-                      bin_threshold_map=None):
+                      bin_threshold_map=None, weight_loader=None):
     """
     Read 4-column sliding-window BED in 5M-line chunks.
 
@@ -286,6 +380,9 @@ def aggregate_windows(filepath, window_size, bio_threshold=0,
       - Threshold is either global (bio_threshold) or per-bin (bin_threshold_map).
       - Valid k-mer counts are stored in a compact array.array('f') buffer.
       - Winsorized mean (5th–95th percentile) is computed at write-time.
+
+    When weight_loader is provided, multiplicity weights are applied to
+    raw counts BEFORE bio-filtering (corrected = raw * weight[pos]).
 
     Per-bin threshold mode (bin_threshold_map):
       - SINE/LINE bins   → class-specific × peak  (Alu/L1 inflation suppressed)
@@ -307,12 +404,16 @@ def aggregate_windows(filepath, window_size, bio_threshold=0,
     n_total = 0
     n_skipped = 0
     n_bio_filtered_total = 0
+    n_mult_corrected = 0
 
     use_per_bin = bin_threshold_map is not None
 
     print(f"[IO] Reading: {filepath}")
     print(f"[IO]   Chunk size: {CHUNK_SIZE:,} lines | bin size: {window_size}bp")
     print(f"[IO]   Aggregation: winsorized mean (p5–p95)")
+    if weight_loader is not None:
+        print(f"[IO]   Multiplicity correction: ENABLED "
+              f"(k_target={weight_loader.k_target}, k_ref={weight_loader.k_ref})")
     if use_per_bin:
         sat_f  = THRESHOLD_FACTORS.get('Satellite',  30.0)
         line_f = THRESHOLD_FACTORS.get('LINE',       150.0)
@@ -348,6 +449,20 @@ def aggregate_windows(filepath, window_size, bio_threshold=0,
         if chunk.empty:
             continue
         n_total += len(chunk)
+
+        # === MULTIPLICITY WEIGHT CORRECTION ===
+        # Applied BEFORE bio-filter so thresholds apply to corrected values.
+        # weight[pos] = M_ref / M_target; corrected = raw * weight
+        if weight_loader is not None:
+            raw_cn_vals = chunk['raw_cn'].values.copy()
+            for chrom_name in chunk['chrom'].unique():
+                mask = chunk['chrom'].values == chrom_name
+                positions = chunk['start'].values[mask]
+                weights = weight_loader.get_weights_bulk(chrom_name, positions)
+                raw_cn_vals[mask] *= weights
+            n_corrected = int(np.sum(raw_cn_vals != chunk['raw_cn'].values))
+            n_mult_corrected += n_corrected
+            chunk['raw_cn'] = raw_cn_vals
 
         chunk['bin_start'] = (chunk['start'].values // window_size) * window_size
 
@@ -413,6 +528,9 @@ def aggregate_windows(filepath, window_size, bio_threshold=0,
     print(f"[IO]   Total lines read:     {n_total:,}")
     print(f"[IO]   Skipped (chrM/etc):   {n_skipped:,}"
           f"{' — ' + str(skipped_display) if skipped_display else ''}")
+    if weight_loader is not None:
+        pct_mult = 100 * n_mult_corrected / max(n_total, 1)
+        print(f"[IO]   Mult-corrected k-mers: {n_mult_corrected:,} ({pct_mult:.2f}%)")
     pct = 100 * n_bio_filtered_total / max(n_total, 1)
     print(f"[IO]   Bio-capped k-mers:    {n_bio_filtered_total:,} ({pct:.2f}%) "
           f"(soft-capped to threshold, not excluded)")
@@ -606,9 +724,24 @@ def main():
                         help='Number of 5M-line chunks to sample for histogram '
                              'peak detection (default: 10 = 50M lines). '
                              'Skipped when --bio-threshold-factor 0.')
+    parser.add_argument('--weight-dir', default=None,
+                        help='Per-chromosome multiplicity weight arrays (.npy) from '
+                             'compute_multiplicity_weights.py. Applies per-position '
+                             'correction: corrected = raw × weight[pos], where '
+                             'weight = M_ref / M_target. Removes repeat element '
+                             'k-mer inflation while preserving SD signal. '
+                             'Backward compatible (no-op when not set).')
     args = parser.parse_args()
 
     use_rm = args.rm_annotation_bed is not None
+
+    # Load multiplicity weights (before histogram, so peak reflects corrected values)
+    weight_loader = None
+    if args.weight_dir is not None:
+        if not os.path.isdir(args.weight_dir):
+            print(f"ERROR: --weight-dir not found: {args.weight_dir}", file=sys.stderr)
+            sys.exit(1)
+        weight_loader = WeightLoader(args.weight_dir)
 
     sex_desc = "all chroms diploid" if args.sex == 'XX' else "chrX/chrY excluded from median"
     print("=" * 60)
@@ -616,6 +749,9 @@ def main():
     print(f"  Sliding windows → {args.window_size}bp bins")
     print(f"  Sex: {args.sex} ({sex_desc})")
     print("  Normalization: genome-wide neutral-band median")
+    if weight_loader is not None:
+        print(f"  Multiplicity correction: {args.weight_dir}")
+        print(f"    k_target={weight_loader.k_target}, k_ref={weight_loader.k_ref}")
     if args.bio_threshold_factor > 0:
         if use_rm:
             print(f"  Biological filter: RM-guided per-bin thresholds "
@@ -629,6 +765,8 @@ def main():
     print(f"Window size: {args.window_size}bp")
     if use_rm:
         print(f"RM annotation: {args.rm_annotation_bed}")
+    if weight_loader is not None:
+        print(f"Weight dir:  {args.weight_dir}")
     print()
 
     # Step 0: Build histogram sample → find Gaussian peak → set bio_threshold
@@ -636,7 +774,8 @@ def main():
     gaussian_peak = 0
     if args.bio_threshold_factor > 0:
         print("[HIST] Sampling k-mer count histogram for Gaussian peak detection...")
-        histogram = build_histogram_sample(args.input, args.hist_sample_chunks)
+        histogram = build_histogram_sample(args.input, args.hist_sample_chunks,
+                                              weight_loader=weight_loader)
         gaussian_peak = find_gaussian_peak(histogram)
         bio_threshold = gaussian_peak * args.bio_threshold_factor
         print(f"[HIST] Biological threshold: {gaussian_peak} × "
@@ -660,7 +799,8 @@ def main():
     acc_values, acc_filtered = aggregate_windows(
         args.input, args.window_size,
         bio_threshold=bio_threshold,
-        bin_threshold_map=bin_threshold_map)
+        bin_threshold_map=bin_threshold_map,
+        weight_loader=weight_loader)
 
     # Step 2: Compute genome-wide normalization factor
     print()

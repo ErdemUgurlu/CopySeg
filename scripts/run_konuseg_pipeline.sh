@@ -226,13 +226,20 @@ else
         echo "  Biological filter: ${BIO_FACTOR}× Gaussian peak (global)"
     fi
 
+    WEIGHT_FLAG=""
+    if [ -n "${WEIGHT_DIR:-}" ] && [ -d "${WEIGHT_DIR}" ]; then
+        WEIGHT_FLAG="--weight-dir ${WEIGHT_DIR}"
+        echo "  Multiplicity correction: ${WEIGHT_DIR}"
+    fi
+
     time python3 scripts/preprocess_kmer_windows.py \
         --input                  "${ONT_KMERS}" \
         --output                 "${WINDOWS_OUT}" \
         --window-size            500 \
         --bio-threshold-factor   "${BIO_FACTOR}" \
         --sex                    "${SEX}" \
-        ${RM_FLAG}
+        ${RM_FLAG} \
+        ${WEIGHT_FLAG}
     echo ""
     echo "Windows written: ${WINDOWS_OUT}"
 fi
@@ -300,11 +307,17 @@ fi
 if [ -z "${PENALTY_FACTOR:-}" ]; then
     PENALTY_FACTOR=$(python3 -c "print(round(288.0 / ${KMER_SIZE}, 1))")
 fi
+NOISE_VAR_FLOOR="${NOISE_VAR_FLOOR:-0.02}"
+WEIGHT_DIR="${WEIGHT_DIR:-}"
 echo "  Segmenter:          ${SEGMENTER}"
 echo "  CV split threshold: ${CV_SPLIT_THRESHOLD}"
 echo "  Merge CN tolerance: ${MERGE_CN_TOLERANCE}"
 echo "  LowDup threshold:   ${LOWDUP_THRESHOLD}"
 echo "  Penalty factor:     ${PENALTY_FACTOR}"
+echo "  Noise var floor:   ${NOISE_VAR_FLOOR}"
+if [ -n "${WEIGHT_DIR}" ]; then
+    echo "  Multiplicity wts:  ${WEIGHT_DIR}"
+fi
 echo "  Min segment len:    ${MIN_SEGMENT_LENGTH}"
 
 if [ "${SKIP_HMM}" = "true" ] && [ -f "${SEGS_OUT}" ]; then
@@ -340,6 +353,7 @@ else
             --merge-cn-tolerance   "${MERGE_CN_TOLERANCE}" \
             --lowdup-threshold     "${LOWDUP_THRESHOLD}" \
             --penalty-factor       "${PENALTY_FACTOR}" \
+            --noise-var-floor      "${NOISE_VAR_FLOOR}" \
             --min-segment-length   "${MIN_SEGMENT_LENGTH}" \
             --min-kmers            "${MIN_KMERS}" \
             ${GC_FLAG} \
@@ -402,11 +416,19 @@ if [ -z "${SAMPLE}" ]; then
     echo "      Set SAMPLE=chm13 or SAMPLE=hg002 to enable GT evaluation."
 else
     echo "  Sample: ${SAMPLE}"
+    WINDOWS_FLAG=""
+    if [ -f "${WINDOWS_OUT}" ]; then
+        WINDOWS_FLAG="--windows ${WINDOWS_OUT}"
+        echo "  Window-level CN: ENABLED"
+    else
+        echo "  Window-level CN: DISABLED (no windows file)"
+    fi
     python3 scripts/evaluate_ground_truth.py \
         --segments "${SEGS_OUT}" \
         --output   "${VALID_DIR}/gt_evaluation_report.md" \
         --kmer-size "${KMER_SIZE}" \
         --sample "${SAMPLE}" \
+        ${WINDOWS_FLAG} \
         2>&1 || true   # non-zero exit should not abort the pipeline
 fi
 

@@ -480,7 +480,8 @@ def run_wpelt_chrom(df_chrom, penalty, min_size_windows, use_weights=True,
 
 
 def run_segmentation(df, penalty=None, min_size=3000, use_weights=True,
-                     lowdup_threshold=1.25, penalty_factor=4.0):
+                     lowdup_threshold=1.25, penalty_factor=4.0,
+                     noise_var_floor=0.02):
     """Run per-chromosome weighted PELT segmentation.
 
     penalty: None → BIC = penalty_factor*log(n) per chromosome (recommended).
@@ -518,6 +519,7 @@ def run_segmentation(df, penalty=None, min_size=3000, use_weights=True,
             nv = None
         else:
             nv = _estimate_noise_var(df_chrom['log2_cn'].values)
+            nv = max(nv, noise_var_floor)
             pen = penalty_factor * np.log(max(n, 2)) * nv
         chrom_work.append((chrom, df_chrom, pen, nv, min_size_windows,
                            use_weights, lowdup_threshold))
@@ -1449,6 +1451,10 @@ def main():
                         help="BIC penalty multiplier. Default: 4.0 (2× standard BIC). "
                              "Larger values → fewer, longer segments. "
                              "Standard BIC = 2.0. Recommended: 4-8 for ONT data.")
+    parser.add_argument("--noise-var-floor", type=float, default=0.02,
+                        help="Min noise variance for BIC penalty. Prevents over-segmentation "
+                             "on clean data (e.g. PacBio noise_var ~0.009). "
+                             "ONT ~0.08 (unaffected). Default: 0.02.")
 
     # --- Post-processing ---
     parser.add_argument("--min-kmers", type=int, default=0,
@@ -1541,6 +1547,7 @@ def main():
     print(f"Max merge gap:       {args.max_merge_gap} bp")
     print(f"LowDup threshold:    {lowdup_threshold}")
     print(f"GC calibration:      {'yes' if args.gc_content_bed else 'no'}")
+    print(f"Noise var floor:     {args.noise_var_floor}")
     print(f"Repeat annotation:   {'yes' if args.repeat_bed else 'no'}")
     print()
 
@@ -1565,6 +1572,7 @@ def main():
         use_weights=use_weights,
         lowdup_threshold=lowdup_threshold,
         penalty_factor=args.penalty_factor,
+        noise_var_floor=args.noise_var_floor,
     )
 
     # -------------------------------------------------------------------------

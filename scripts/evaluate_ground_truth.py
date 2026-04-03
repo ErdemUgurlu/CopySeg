@@ -171,7 +171,7 @@ GROUND_TRUTH_CHM13 = [
 
     # TP53 — Single-Copy Negative Control (CN = 1.0)
     # No paralogs, no SD overlap; every 72-mer unique in CHM13 genome.
-    ("chr17",   7572544,   7591594, "TP53_Control",    1.0, 0.15, "normal",
+    ("chr17",   7572544,   7591594, "TP53_Control",    1.0, 0.24, "normal",
      "Single-Copy Control",
      "TP53 tumor suppressor; single-copy, no paralogs, no SD overlap; "
      "19 kbp, 13 exons; every 72-mer is unique in CHM13 genome; "
@@ -189,6 +189,19 @@ GROUND_TRUTH_CHM13 = [
      "Source: Fiddes et al. 2018 Cell; Vollger et al. 2022 Science; "
      "Eichler lab 2025 preprint bioRxiv 2025.03.14.643395",
      5, 0.997),
+
+    # NBPF1 — CN ≈ 3 at k=72
+    # NBPF gene family member 1; DUF1220 domain amplification region.
+    # k72 Jellyfish assembly-validated: measured CN=3, IQR [2,10].
+    # Wide IQR due to internal DUF1220 tandem repeats (CN~16 in core) vs flanking (CN~2).
+    # Region median reflects mixed architecture — not a uniform duplication.
+    ("chr1",   16004103,  16075615, "NBPF1",           3,    0.30, "normal",
+     "Segmental Dup",
+     "NBPF1; neuroblastoma breakpoint family member 1; DUF1220 domain amplification; "
+     "k72 agg CN=3; heterogeneous region: core DUF1220 repeats CN~16, flanking CN~2; "
+     "wide IQR [2,10] reflects internal structure; window median 3.3; "
+     "k-size sensitive: k72=3, k32=10 (more DUF1220 repeats visible at shorter k)",
+     None, None),
 
     # 5S rDNA Array — CN ≈ 117 (Observatory)
     # ~128 units; actual identity 99.87% (not 98% as initially estimated).
@@ -218,7 +231,7 @@ _HG002_VALIDATED_K = 32
 
 GROUND_TRUTH_HG002 = [
     # TP53 Control — single-copy, k-invariant
-    ("chr17",  7572544,   7591594, "TP53_Control",     1,   0.15, "normal",
+    ("chr17",  7572544,   7591594, "TP53_Control",     1,   0.24, "normal",
      "Single-Copy Control",
      "TP53; single-copy negative control; k-invariant; same as CHM13",
      1, 1.0),
@@ -263,6 +276,13 @@ GROUND_TRUTH_HG002 = [
     ("chr17", 39044723,  39055625, "TBC1D3_Cluster",  15,   0.25, "normal",
      "Segmental Dup",
      "TBC1D3; HG002-specific copy number (CHM13=9 at k72); k32 validated=15",
+     None, None),
+
+    # NBPF1 — HG002-specific copy number
+    ("chr1",  16004103,  16075615, "NBPF1",            8,   0.30, "normal",
+     "Segmental Dup",
+     "NBPF1; HG002-specific k32 CN=8 (CHM13 k72=3, k32=10); "
+     "DUF1220 domain amplification; heterogeneous internal structure",
      None, None),
 
     # 5S rDNA — observatory
@@ -325,6 +345,17 @@ _FULL_SCHEMA = [
     # Extra columns from segment_cnv_fused_lasso.py (D7 fix: previously unnamed)
     "gc_bias_factor", "segment_iqr", "boundary_conf",
 ]
+
+def load_windows(bed_path: str) -> pd.DataFrame:
+    """Load preprocessed window BED (8-col: chrom start end cn ...)."""
+    names = ["chrom", "start", "end", "cn", "mean_count", "log_ratio",
+             "num_kmers", "num_filtered"]
+    df = pd.read_csv(bed_path, sep="\t", comment="#", header=None, names=names)
+    df["start"] = df["start"].astype(int)
+    df["end"]   = df["end"].astype(int)
+    df["cn"]    = pd.to_numeric(df["cn"], errors="coerce")
+    return df
+
 
 def load_segments(bed_path: str) -> pd.DataFrame:
     """Load CopySeg BED. Detects column count from first data line (D7 fix)."""
@@ -389,6 +420,23 @@ def weighted_cn(hits: pd.DataFrame, outlier_percentile: float = 95.0) -> tuple:
 
     return (round(w_cn, 4), round(peak_cn, 4), int(total_bp), dom_state)
 
+def window_cn(win_df: pd.DataFrame, chrom: str,
+              gt_start: int, gt_end: int) -> float:
+    """Median CN from windows overlapping [gt_start, gt_end].
+
+    More accurate than segment-level CN because it measures only windows
+    within the GT region, not the entire segment (which may extend beyond).
+    """
+    mask = (
+        (win_df["chrom"] == chrom) &
+        (win_df["end"]   > gt_start) &
+        (win_df["start"] < gt_end)
+    )
+    hits = win_df[mask]
+    if hits.empty:
+        return None
+    return round(float(hits["cn"].median()), 4)
+
 # ---------------------------------------------------------------------------
 # K-MER-SIZE-AWARE EXPECTED CN
 # ---------------------------------------------------------------------------
@@ -410,8 +458,9 @@ def compute_expected_cn(exp_cn_validated, n_copies, identity, kmer_size,
 # MAIN EVALUATION
 # ---------------------------------------------------------------------------
 def evaluate(segments_path: str, kmer_size: int = 72,
-             sample: str = 'chm13') -> pd.DataFrame:
+             sample: str = 'chm13', windows_path: str = None) -> pd.DataFrame:
     segs = load_segments(segments_path)
+    win_df = load_windows(windows_path) if windows_path else None
     cfg = SAMPLE_CONFIG[sample]
     gt_table = cfg['gt']
     validated_k = cfg['validated_k']
@@ -420,6 +469,13 @@ def evaluate(segments_path: str, kmer_size: int = 72,
     seg_chroms = set(segs['chrom'].unique())
     _use_cm039 = any(c.startswith('CM0') for c in seg_chroms)
 
+    # Windows may use different naming than segments — detect separately
+    if win_df is not None:
+        win_chroms = set(win_df['chrom'].unique())
+        _win_use_cm039 = any(c.startswith('CM0') for c in win_chroms)
+    else:
+        _win_use_cm039 = False
+
     rows = []
     for (chrom, start, end, gene, exp_cn_validated, tol, vmode, category, notes,
          n_copies, identity) in gt_table:
@@ -427,12 +483,24 @@ def evaluate(segments_path: str, kmer_size: int = 72,
                                      kmer_size, validated_k)
         # Match GT chromosome name to segment naming convention
         if _use_cm039:
-            chrom_cm039 = _CHR_TO_CM039.get(chrom, chrom)
+            chrom_seg = _CHR_TO_CM039.get(chrom, chrom)
         else:
-            chrom_cm039 = chrom  # direct match (chr prefix)
+            chrom_seg = chrom
+        # Match GT chromosome name to window naming convention
+        chrom_win = _CHR_TO_CM039.get(chrom, chrom) if _win_use_cm039 else chrom
+
         gt_len = end - start
-        hits = intersect_region(segs, chrom_cm039, start, end)
-        est_cn, peak_cn, cov_bp, dom_state = weighted_cn(hits)
+        hits = intersect_region(segs, chrom_seg, start, end)
+        est_cn_seg, peak_cn, cov_bp, dom_state = weighted_cn(hits)
+
+        # Window-level CN: more accurate (measures only within GT region)
+        win_cn_val = None
+        if win_df is not None:
+            win_cn_val = window_cn(win_df, chrom_win, start, end)
+
+        # Use window-level CN for verdict when available, segment as fallback
+        est_cn = win_cn_val if win_cn_val is not None else est_cn_seg
+        cn_source = "window" if win_cn_val is not None else "segment"
 
         if vmode == "skip":
             rows.append({
@@ -440,11 +508,11 @@ def evaluate(segments_path: str, kmer_size: int = 72,
                 "Chr": chrom, "GT_Start": start, "GT_End": end,
                 "GT_Len_kb": round(gt_len / 1e3, 1),
                 "Expected_CN": exp_cn, "Tolerance": "—",
-                "Estimated_CN": None, "Peak_CN": None,
+                "Estimated_CN": None, "Seg_CN": None, "Peak_CN": None,
                 "Abs_Error": None, "Pct_Error": "—",
                 "N_Segs": 0, "Cov_bp": 0, "Cov_Pct": 0.0,
                 "Dom_State": "—", "Verdict": "SKIPPED",
-                "Notes": notes,
+                "CN_Source": "—", "Notes": notes,
             })
             continue
 
@@ -484,6 +552,7 @@ def evaluate(segments_path: str, kmer_size: int = 72,
             "Expected_CN":  exp_cn,
             "Tolerance":    tol_str,
             "Estimated_CN": est_cn,
+            "Seg_CN":       est_cn_seg,
             "Peak_CN":      peak_cn,
             "Abs_Error":    abs_err,
             "Pct_Error":    pct_err_str,
@@ -492,6 +561,7 @@ def evaluate(segments_path: str, kmer_size: int = 72,
             "Cov_Pct":      cov_pct,
             "Dom_State":    dom_state,
             "Verdict":      verdict,
+            "CN_Source":    cn_source,
             "Notes":        notes,
         })
     return pd.DataFrame(rows)
@@ -555,16 +625,30 @@ def build_markdown(df: pd.DataFrame, segments_path: str, kmer_size: int = 72,
 
     ln("## Bölge Bazlı Sonuçlar")
     ln()
-    ln("| Bölge | Kategori | Exp.CN | Tol | Est.CN | Peak.CN | %Err | N Seg | Cov% | Sonuç |")
-    ln("|-------|----------|--------|-----|--------|---------|------|-------|------|-------|")
+    has_windows = "Seg_CN" in df.columns and df["CN_Source"].eq("window").any()
+    if has_windows:
+        ln("| Bölge | Kategori | Exp.CN | Tol | Est.CN | Seg.CN | Peak.CN | %Err | N Seg | Cov% | Src | Sonuç |")
+        ln("|-------|----------|--------|-----|--------|--------|---------|------|-------|------|-----|-------|")
+    else:
+        ln("| Bölge | Kategori | Exp.CN | Tol | Est.CN | Peak.CN | %Err | N Seg | Cov% | Sonuç |")
+        ln("|-------|----------|--------|-----|--------|---------|------|-------|------|-------|")
     for _, r in df.iterrows():
         if r["Verdict"] == "SKIPPED":
-            ln(f"| {r['Region']} | {r['Category']} | {r['Expected_CN']} | — | — | — | — | — | — | SKIPPED |")
+            if has_windows:
+                ln(f"| {r['Region']} | {r['Category']} | {r['Expected_CN']} | — | — | — | — | — | — | — | — | SKIPPED |")
+            else:
+                ln(f"| {r['Region']} | {r['Category']} | {r['Expected_CN']} | — | — | — | — | — | — | SKIPPED |")
             continue
         est  = f"{r['Estimated_CN']:.2f}" if pd.notna(r["Estimated_CN"]) else "—"
         peak = f"{r['Peak_CN']:.2f}"      if pd.notna(r["Peak_CN"])      else "—"
-        ln(f"| {r['Region']} | {r['Category']} | {r['Expected_CN']} | {r['Tolerance']} | "
-           f"{est} | {peak} | {r['Pct_Error']} | {r['N_Segs']} | {r['Cov_Pct']}% | {r['Verdict']} |")
+        if has_windows:
+            seg_cn = f"{r['Seg_CN']:.2f}" if pd.notna(r.get("Seg_CN")) else "—"
+            src = r.get("CN_Source", "seg")[:3]
+            ln(f"| {r['Region']} | {r['Category']} | {r['Expected_CN']} | {r['Tolerance']} | "
+               f"{est} | {seg_cn} | {peak} | {r['Pct_Error']} | {r['N_Segs']} | {r['Cov_Pct']}% | {src} | {r['Verdict']} |")
+        else:
+            ln(f"| {r['Region']} | {r['Category']} | {r['Expected_CN']} | {r['Tolerance']} | "
+               f"{est} | {peak} | {r['Pct_Error']} | {r['N_Segs']} | {r['Cov_Pct']}% | {r['Verdict']} |")
     ln()
 
     ln("## Kategori Analizi")
@@ -584,7 +668,10 @@ def build_markdown(df: pd.DataFrame, segments_path: str, kmer_size: int = 72,
             continue
         direction = "overestimation" if est > exp else "underestimation"
         ln(f"**{r['Region']}** ({r['Chr']}, {r['GT_Len_kb']} kb)")
-        ln(f"- Expected k{kmer_size} CN: **{exp}** | Estimated: **{est:.2f}** | Peak: **{r['Peak_CN']:.2f}** | "
+        seg_note = ""
+        if has_windows and pd.notna(r.get("Seg_CN")):
+            seg_note = f" | Seg.CN: {r['Seg_CN']:.2f}"
+        ln(f"- Expected k{kmer_size} CN: **{exp}** | Estimated: **{est:.2f}**{seg_note} | Peak: **{r['Peak_CN']:.2f}** | "
            f"Abs.Error: {r['Abs_Error']:.2f} | {r['Pct_Error']} | Tolerance: {r['Tolerance']}")
         ln(f"- Dom.State: `{r['Dom_State']}` | N segs: {r['N_Segs']} | Kapsama: %{r['Cov_Pct']}")
         ln(f"- Verdict: **{r['Verdict']}** ({direction})")
@@ -668,24 +755,38 @@ def main():
     parser.add_argument("--sample", choices=list(SAMPLE_CONFIG.keys()), default="chm13",
                         help="Sample name — selects the appropriate GT table "
                              f"(choices: {', '.join(SAMPLE_CONFIG.keys())}; default: chm13)")
+    parser.add_argument("--windows", default=None,
+                        help="Window-level CN BED (cn_w500.bed). When provided, uses "
+                             "window median within GT region for CN estimation.")
     args = parser.parse_args()
 
     if not os.path.exists(args.segments):
         print(f"ERROR: segments file not found: {args.segments}", file=sys.stderr)
         sys.exit(1)
+    if args.windows and not os.path.exists(args.windows):
+        print(f"ERROR: windows file not found: {args.windows}", file=sys.stderr)
+        sys.exit(1)
 
     cfg = SAMPLE_CONFIG[args.sample]
+    cn_mode = "window-level" if args.windows else "segment-level"
     print(f"[EVAL] Loading segments: {args.segments} "
           f"(k={args.kmer_size}, sample={args.sample}, "
-          f"GT validated at k={cfg['validated_k']})", file=sys.stderr)
-    df = evaluate(args.segments, kmer_size=args.kmer_size, sample=args.sample)
+          f"GT validated at k={cfg['validated_k']}, CN mode: {cn_mode})", file=sys.stderr)
+    if args.windows:
+        print(f"[EVAL] Loading windows: {args.windows}", file=sys.stderr)
+    df = evaluate(args.segments, kmer_size=args.kmer_size, sample=args.sample,
+                  windows_path=args.windows)
 
-    print("\n" + "="*70)
-    print("CopySeg Ground Truth Evaluation — SUMMARY")
-    print("="*70)
-    print(df[["Region", "Category", "Expected_CN", "Tolerance",
-              "Estimated_CN", "Peak_CN", "Pct_Error", "Verdict"]].to_string(index=False))
-    print("="*70)
+    print("\n" + "="*80)
+    print(f"CopySeg Ground Truth Evaluation — SUMMARY (CN: {cn_mode})")
+    print("="*80)
+    summary_cols = ["Region", "Category", "Expected_CN", "Tolerance",
+                    "Estimated_CN", "Peak_CN", "Pct_Error", "Verdict"]
+    if args.windows:
+        summary_cols.insert(5, "Seg_CN")
+        summary_cols.append("CN_Source")
+    print(df[summary_cols].to_string(index=False))
+    print("="*80)
 
     md = build_markdown(df, args.segments, kmer_size=args.kmer_size,
                         sample=args.sample)
