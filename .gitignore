@@ -1,0 +1,49 @@
+# Output data (30GB+)
+output/
+
+# Input data
+data/
+
+# Raw histograms
+raw_kmer_histograms/
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# pytest
+.pytest_cache/
+
+# Claude Code
+.claude/
+Claude Prompt/
+
+# IDE
+.vscode/
+.idea/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+logs/
+*.log
+
+# Analysis outputs (regenerated from pipeline runs)
+analysis_pass2/
+
+# Local archive of superseded runs (kept off-repo)
+archive/
